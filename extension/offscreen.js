@@ -42,7 +42,16 @@ function emitProcessingProgress(value) {
 }
 
 function progressFromLog(message) {
-  if (!activeJob?.duration || typeof message !== 'string') return;
+  if (!activeJob || typeof message !== 'string') return;
+  if (!activeJob.duration) {
+    const durMatch = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(message);
+    if (durMatch) {
+      const durSec = Number(durMatch[1]) * 3600 + Number(durMatch[2]) * 60 + Number(durMatch[3]);
+      if (Number.isFinite(durSec) && durSec > 0) activeJob.duration = durSec;
+    }
+  }
+  if (!activeJob.duration) return;
+
   const microseconds = /(?:^|\s)(?:out_time_us|out_time_ms)=(\d+)/.exec(message);
   const clock = /(?:out_time|time)=(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(message);
   const seconds = microseconds
@@ -158,7 +167,7 @@ function beginJob(message) {
     transcode: Boolean(message.transcode),
     format: message.format || 'mp4',
     scaleHeight: Number(message.scaleHeight) || 0,
-    duration: Number(message.duration) || 0,
+    duration: Number(message.duration) > 0 ? Number(message.duration) : 0,
     lastProgress: 0,
     lastProgressAt: 0,
   };
