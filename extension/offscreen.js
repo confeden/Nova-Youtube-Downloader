@@ -4,12 +4,11 @@
 const { FFmpeg } = FFmpegWASM;
 const FFMPEG_LOG_LIMIT = 40;
 const STALE_JOB_MS = 5 * 60_000;
-const MULTI_THREAD_STALL_MS = 30_000;
 const SINGLE_THREAD_STALL_MS = 90_000;
 
 let ffmpeg;
 let ffmpegLoad;
-let ffmpegMode = 'single-thread';
+const ffmpegMode = 'single-thread';
 let activeJob;
 const ffmpegLogs = [];
 
@@ -81,37 +80,13 @@ async function loadSingleThreadFFmpeg() {
     coreURL: `${base}ffmpeg-core.js`,
     wasmURL: `${base}ffmpeg-core.wasm`,
   });
-  ffmpegMode = 'single-thread';
   return instance;
-}
-
-async function loadBestFFmpeg() {
-  const threadsAvailable = globalThis.crossOriginIsolated
-    && typeof globalThis.SharedArrayBuffer === 'function';
-  if (threadsAvailable) {
-    const instance = createFFmpegInstance();
-    const base = chrome.runtime.getURL('vendor/ffmpeg-mt/');
-    try {
-      await instance.load({
-        coreURL: `${base}ffmpeg-core.js`,
-        wasmURL: `${base}ffmpeg-core.wasm`,
-        workerURL: `${base}ffmpeg-core.worker.js`,
-      });
-      ffmpegMode = 'multi-thread';
-      return instance;
-    } catch (error) {
-      try { instance.terminate(); } catch {}
-      ffmpegLogs.push(`multi-thread initialization failed: ${String(error?.message || error)}`);
-      sendProgress(0, 'Многопоточный режим недоступен — используется совместимый режим…', 0);
-    }
-  }
-  return loadSingleThreadFFmpeg();
 }
 
 async function getFFmpeg() {
   if (ffmpeg) return ffmpeg;
   if (!ffmpegLoad) {
-    ffmpegLoad = loadBestFFmpeg()
+    ffmpegLoad = loadSingleThreadFFmpeg()
       .then((instance) => {
         ffmpeg = instance;
         return instance;
@@ -122,16 +97,6 @@ async function getFFmpeg() {
     });
   }
   return ffmpegLoad;
-}
-
-async function replaceWithSingleThread(instance) {
-  try { instance.terminate(); } catch {}
-  ffmpeg = undefined;
-  ffmpegLoad = undefined;
-  const replacement = await loadSingleThreadFFmpeg();
-  ffmpeg = replacement;
-  ffmpegLoad = Promise.resolve(replacement);
-  return replacement;
 }
 
 async function execWithProgressWatchdog(instance, args, job, timeoutMs) {
@@ -157,7 +122,9 @@ async function execWithProgressWatchdog(instance, args, job, timeoutMs) {
 }
 
 async function writeInputFiles(instance, inputs) {
-  for (const input of inputs) await instance.writeFile(input.name, input.bytes);
+  // FFmpeg transfers the provided buffer to its Worker and detaches it. Always
+  // send a disposable copy so the offscreen document retains local ownership.
+  for (const input of inputs) await instance.writeFile(input.name, input.bytes.slice());
 }
 
 function decodeBase64(value) {
@@ -358,20 +325,7 @@ async function finalizeJob(message) {
       job.lastProgressAt = Date.now();
       sendProgress(0, processingStatus(job), 0);
       files.add(run.out);
-      let exitCode;
-      try {
-        const timeout = ffmpegMode === 'multi-thread' ? MULTI_THREAD_STALL_MS : SINGLE_THREAD_STALL_MS;
-        exitCode = await execWithProgressWatchdog(instance, run.args, job, timeout);
-      } catch (error) {
-        if (error?.code !== 'FFMPEG_STALLED' || ffmpegMode !== 'multi-thread') throw error;
-        ffmpegLogs.push(`multi-thread execution stalled: ${error.message}`);
-        sendProgress(0, 'Многопоточный режим завис — повтор в совместимом режиме…', 0);
-        instance = await replaceWithSingleThread(instance);
-        await writeInputFiles(instance, inputs);
-        job.lastProgress = 0;
-        job.lastProgressAt = Date.now();
-        exitCode = await execWithProgressWatchdog(instance, run.args, job, SINGLE_THREAD_STALL_MS);
-      }
+      const exitCode = await execWithProgressWatchdog(instance, run.args, job, SINGLE_THREAD_STALL_MS);
       if (exitCode === 0) {
         const candidate = await instance.readFile(run.out).catch(() => null);
         if (candidate?.length) {

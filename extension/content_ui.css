@@ -37,8 +37,8 @@
   text-transform: none;
   white-space: nowrap;
 }
-.nova-brand-head a { color: #8f7cff; font-weight: 400; text-decoration: none; }
-.nova-brand-head a:hover { color: #aba0ff; text-decoration: underline; }
+.nova-brand-head a { color: #818cf8; font-weight: 400; text-decoration: none; }
+.nova-brand-head a:hover { color: #a5b4fc; text-decoration: underline; }
 .nova-menu-item {
   color: #fff;
   padding: 9px 14px;

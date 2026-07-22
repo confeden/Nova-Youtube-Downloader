@@ -55,6 +55,7 @@
     tracks: Object.create(null),
     _lastInit: Object.create(null),
     _pendingInit: Object.create(null),
+    sourceBuffers: { audio: new Set(), video: new Set() },
   };
 
   function vidId() {
@@ -71,6 +72,7 @@
     store.tracks = Object.create(null);
     store._lastInit = Object.create(null);
     store._pendingInit = Object.create(null);
+    store.sourceBuffers = { audio: new Set(), video: new Set() };
   }
 
   const isAv1 = (s) => typeof s === 'string' && /av01|av1\b/i.test(s);
@@ -165,6 +167,7 @@
     try {
       sb.__novaMime = mime;
       sb.__novaKind = /audio/i.test(mime) ? 'audio' : (/video/i.test(mime) ? 'video' : null);
+      if (sb.__novaKind) store.sourceBuffers[sb.__novaKind].add(sb);
     } catch (e) {}
     return sb;
   };
@@ -179,13 +182,14 @@
           const mime = this.__novaMime || '';
           if (init) {
             const bytes = u8.slice();
-            store._lastInit[kind] = { bytes, mime };
+            const height = kind === 'video' ? currentQuality() : null;
+            store._lastInit[kind] = { bytes, mime, height };
             if (store.tracks[kind]) {
               // Keep the complete previous representation until the first media
               // fragment for the new one arrives; an init-only file is unusable.
-              store._pendingInit[kind] = { bytes, mime };
+              store._pendingInit[kind] = { bytes, mime, height };
             } else {
-              store.tracks[kind] = { mime, parts: [bytes] };
+              store.tracks[kind] = { mime, height, parts: [bytes] };
             }
           } else {
             const pendingInit = store._pendingInit[kind];
@@ -193,15 +197,28 @@
             if (pendingInit) {
               // Atomically switch representations so bytes from different fMP4
               // tracks never share one output file.
-              t = store.tracks[kind] = { mime: mime || pendingInit.mime, parts: [pendingInit.bytes, u8.slice()] };
+              t = store.tracks[kind] = {
+                mime: mime || pendingInit.mime,
+                height: kind === 'video' ? (currentQuality() || pendingInit.height) : null,
+                parts: [pendingInit.bytes, u8.slice()],
+              };
               delete store._pendingInit[kind];
             } else {
               t = store.tracks[kind];
             }
             if (!t) {
               const savedInit = store._lastInit[kind];
-              if (savedInit) t = store.tracks[kind] = { mime: mime || savedInit.mime, parts: [savedInit.bytes, u8.slice()] };
-            } else if (!pendingInit) t.parts.push(u8.slice());
+              if (savedInit) {
+                t = store.tracks[kind] = {
+                  mime: mime || savedInit.mime,
+                  height: kind === 'video' ? (currentQuality() || savedInit.height) : null,
+                  parts: [savedInit.bytes, u8.slice()],
+                };
+              }
+            } else if (!pendingInit) {
+              t.parts.push(u8.slice());
+              if (kind === 'video') t.height = currentQuality() || t.height;
+            }
           }
         }
       }
@@ -228,7 +245,7 @@
       let n = 0; for (const p of parts) n += p.length;
       const buf = new Uint8Array(n);
       let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
-      out[kind] = { bytes: buf, mime: t.mime };
+      out[kind] = { bytes: buf, mime: t.mime, height: t.height || null };
     }
     return out;
   }
@@ -239,11 +256,46 @@
   const QUALITY_BY_HEIGHT = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720', 480: 'large', 360: 'medium', 240: 'small', 144: 'tiny' };
   const HEIGHT_BY_QUALITY = Object.fromEntries(Object.entries(QUALITY_BY_HEIGHT).map(([height, quality]) => [quality, Number(height)]));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let defaultQualityAppliedVideoId = null;
+  let manuallySelectedQualityVideoId = null;
+  let manualQualityRevision = 0;
 
   function setQualityRaw(q) {
     const p = player();
     try { p.setPlaybackQualityRange && p.setPlaybackQualityRange(q, q); } catch (e) {}
     try { p.setPlaybackQuality && p.setPlaybackQuality(q); } catch (e) {}
+  }
+  function recommendQuality(q) {
+    const p = player();
+    try { p && p.setPlaybackQuality && p.setPlaybackQuality(q); } catch (e) {}
+  }
+  function qualitySnapshot() {
+    const p = player();
+    let range = null;
+    try { range = p?.getPlaybackQualityRange?.() || null; } catch (e) {}
+    let quality = null;
+    try { quality = p?.getPlaybackQuality?.() || null; } catch (e) {}
+    return { quality, range, videoId: vidId(), manualRevision: manualQualityRevision };
+  }
+  function restoreQuality(snapshot) {
+    const p = player();
+    if (!p || !snapshot?.quality) return;
+    // Do not overwrite a quality selected by the user while the download was
+    // running, and never apply an old video's quality after navigation.
+    if (snapshot.videoId !== vidId() || snapshot.manualRevision !== manualQualityRevision) return;
+    try {
+      if (Array.isArray(snapshot.range) && snapshot.range.length >= 2) {
+        p.setPlaybackQualityRange?.(snapshot.range[0], snapshot.range[1]);
+      } else if (snapshot.range && typeof snapshot.range === 'object') {
+        const min = snapshot.range.min || snapshot.range.minQuality;
+        const max = snapshot.range.max || snapshot.range.maxQuality;
+        if (min && max) p.setPlaybackQualityRange?.(min, max);
+        else p.setPlaybackQualityRange?.('tiny', 'highres');
+      } else {
+        p.setPlaybackQualityRange?.('tiny', 'highres');
+      }
+      p.setPlaybackQuality?.(snapshot.quality);
+    } catch (e) {}
   }
   function availableHeights() {
     try {
@@ -256,6 +308,39 @@
       return HEIGHT_BY_QUALITY[quality] || null;
     } catch (e) { return null; }
   }
+  function monitorDefaultHeight() {
+    const ratio = Number(window.devicePixelRatio) || 1;
+    const shortEdge = Math.min(Number(screen.width) || 0, Number(screen.height) || 0) * ratio;
+    if (shortEdge >= 2160) return 2160;
+    if (shortEdge >= 1440) return 1440;
+    if (shortEdge >= 1080) return 1080;
+    if (shortEdge >= 720) return 720;
+    return 480;
+  }
+  function scheduleDefaultQuality() {
+    const videoId = vidId();
+    if (!videoId || defaultQualityAppliedVideoId === videoId) return;
+    let tries = 30;
+    (function tick() {
+      if (vidId() !== videoId || defaultQualityAppliedVideoId === videoId) return;
+      if (manuallySelectedQualityVideoId === videoId) {
+        defaultQualityAppliedVideoId = videoId;
+        return;
+      }
+      const heights = availableHeights().sort((a, b) => b - a);
+      if (!heights.length && tries-- > 0) { setTimeout(tick, 200); return; }
+      const target = monitorDefaultHeight();
+      const selected = heights.find((height) => height <= target) || heights[heights.length - 1];
+      const quality = QUALITY_BY_HEIGHT[selected];
+      defaultQualityAppliedVideoId = videoId;
+      if (quality) {
+        // A recommendation only: no quality range is pinned, and a later
+        // selection in YouTube's own menu always wins.
+        recommendQuality(quality);
+        log('quality', 'default recommendation', selected + 'p', 'monitorShortEdge=', monitorDefaultHeight());
+      }
+    })();
+  }
   function keepAutoplayOff() {
     try {
       const btn = document.querySelector('.ytp-autonav-toggle-button');
@@ -263,6 +348,38 @@
       if (btn.getAttribute('aria-checked') === 'true') btn.click();
       return true;
     } catch (e) { return false; }
+  }
+
+  const waitForUpdateEnd = (sb, timeoutMs = 2500) => new Promise((resolve) => {
+    if (!sb?.updating) { resolve(); return; }
+    let timer;
+    const done = () => {
+      clearTimeout(timer);
+      try { sb.removeEventListener('updateend', done); } catch (e) {}
+      resolve();
+    };
+    try { sb.addEventListener('updateend', done, { once: true }); } catch (e) { resolve(); return; }
+    timer = setTimeout(done, timeoutMs);
+  });
+
+  async function clearVideoBufferForExactQuality() {
+    let cleared = false;
+    for (const sb of [...store.sourceBuffers.video]) {
+      try {
+        await waitForUpdateEnd(sb);
+        if (!sb.buffered?.length) continue;
+        sb.remove(sb.buffered.start(0), sb.buffered.end(sb.buffered.length - 1));
+        await waitForUpdateEnd(sb);
+        cleared = true;
+      } catch (e) {
+        log('capture', 'could not clear old video buffer:', e?.message || e);
+      }
+    }
+    if (cleared) {
+      delete store.tracks.video;
+      delete store._pendingInit.video;
+    }
+    return cleared;
   }
 
   // ---- capture ---------------------------------------------------------------
@@ -294,8 +411,20 @@
 
     store.capturing = true; // passive + active capture via appendBuffer hook
     keepAutoplayOff();
+    const previousHeight = currentQuality();
+    const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
+    const seekTo = (sec) => { try { const p = player(); if (p && p.seekTo) { p.seekTo(sec, true); return; } } catch (e) {} try { v.currentTime = sec; } catch (e) {} };
+    const restoreMediaState = () => {
+      try { v.playbackRate = prev.rate; } catch (e) {}
+      seekTo(prev.time);
+      try { v.muted = prev.muted; } catch (e) {}
+      if (!prev.paused) { try { v.play()?.catch?.(() => {}); } catch (e) {} }
+    };
     // Request target quality so the captured track is the desired one.
-    setQualityRaw(targetQ);
+    if (needVideo) {
+      try { if (!v.paused) v.pause(); } catch (e) {}
+      setQualityRaw(targetQ);
+    }
     // SABR often ignores setPlaybackQuality; wait (up to ~6s) for the player to
     // actually switch to the requested quality before we start capturing.
     const wantQ = QUALITY_BY_HEIGHT[opts.height] || null;
@@ -307,6 +436,12 @@
       const got = currentQuality();
       if (got && got !== opts.height) {
         log('capture', 'requested ' + opts.height + 'p but player is on ' + got + 'p (SABR ignored request)');
+      }
+      if (got && got !== previousHeight) {
+        const cleared = await clearVideoBufferForExactQuality();
+        if (cleared) {
+          try { player()?.seekTo?.(0, true); } catch (e) { try { v.currentTime = 0; } catch (ignore) {} }
+        }
       }
     }
     // Wait for the init segment(s) of the track(s) we need.
@@ -326,20 +461,17 @@
       return end;
     };
 
-    // Snapshot where the user was, restore it at the very end.
-    const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
-
     // Already fully buffered up to the capture end? Nothing to fetch -> no seek.
     if (bufferedEnd() >= capEnd - 1.0) {
       onProgress(1);
-      return { actualHeight: currentQuality(), duration: capEnd };
+      restoreMediaState();
+      return { actualHeight: store.tracks.video?.height || currentQuality(), duration: capEnd };
     }
 
     // Only seek-fill the NOT-yet-buffered tail (from the buffered edge to the
     // end). Everything already buffered was captured passively and is kept in
     // store.tracks, so we never re-fetch the beginning. This keeps the seek
     // pass as short as possible.
-    const seekTo = (sec) => { try { const p = player(); if (p && p.seekTo) { p.seekTo(sec, true); return; } } catch (e) {} try { v.currentTime = sec; } catch (e) {} };
     let cursor = bufferedEnd();
     try { v.muted = true; } catch (e) {}
 
@@ -357,13 +489,10 @@
       }
     } finally {
       // Restore the user's exact position and play state immediately.
-      try { v.playbackRate = prev.rate; } catch (e) {}
-      seekTo(prev.time);
-      try { v.muted = prev.muted; } catch (e) {}
-      if (!prev.paused) { try { v.play(); } catch (e) {} }
+      restoreMediaState();
     }
     onProgress(1);
-    return { actualHeight: currentQuality(), duration: capEnd };
+    return { actualHeight: store.tracks.video?.height || currentQuality(), duration: capEnd };
   }
 
   // ---- subtitles ------------------------------------------------------------
@@ -877,10 +1006,6 @@
     const vid = vidId();
     const rawUrl = track.baseUrl || track.url || '';
 
-    // Strategy 0: Trigger YouTube Player native caption module & intercept network response
-    const playerResult = await triggerPlayerCaptions(track);
-    if (playerResult) return { parsed: playerResult, diag: 'player_driven' };
-
     const candidates = [];
     if (rawUrl) {
       candidates.push(rawUrl); // PRESERVE EXACT RAW URL WITH SIGNATURE UNTOUCHED!
@@ -893,7 +1018,8 @@
     const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
 
     let failLog = [];
-    // Strategy 1: Fetch from main world with credentials: 'omit'
+    // Strategy 0: use the signed timedtext URL immediately. Do not wait for the
+    // player caption module unless every direct request fails.
     for (const u of uniqueCandidates) {
       try {
         const r = await fetch(u, { credentials: 'omit' });
@@ -908,7 +1034,7 @@
       } catch (e) { failLog.push('omit_err'); }
     }
 
-    // Strategy 2: Fetch from main world with credentials: 'include'
+    // Strategy 1: Fetch from main world with credentials: 'include'
     for (const u of uniqueCandidates) {
       try {
         const r = await fetch(u, { credentials: 'include' });
@@ -923,7 +1049,7 @@
       } catch (e) { failLog.push('inc_err'); }
     }
 
-    // Strategy 3: Background proxy fetch
+    // Strategy 2: Background proxy fetch
     for (const u of uniqueCandidates) {
       const bg = await fetchViaBackground(u);
       if (bg && bg.ok && bg.text && bg.text.length > 5) {
@@ -1227,7 +1353,18 @@
       return { text: instantCues.lines.join('\n'), cues: cues, lang: lang };
     }
 
-    // 1. Primary: innertube get_transcript API (modern YouTube)
+    // 1. Primary: the caption track already contains a signed timedtext URL.
+    // This is normally one small request and avoids scanning the full page data.
+    try {
+      const { parsed, diag: d } = await fetchCaptionFromTrack(track);
+      if (d) fetchDiag += d;
+      if (parsed && parsed.lines && parsed.lines.length) {
+        closeTranscriptPanelIfOpen();
+        return { text: parsed.lines.join('\n'), cues: parsed.cues || null, lang: parsed.lang || lang };
+      }
+    } catch (e) { fetchDiag += ' timedtext_err=' + (e && e.message); }
+
+    // 2. Fallback: innertube get_transcript API (modern YouTube)
     const vid = vidId();
     const kind = getTrackKind(track);
     if (vid) {
@@ -1240,15 +1377,13 @@
       fetchDiag += (itRes && itRes.diag ? itRes.diag : 'innertube=empty') + ' ';
     }
 
-    // 2. Fallback: old timedtext GET API (single attempt)
-    try {
-      const { parsed, diag: d } = await fetchCaptionFromTrack(track);
-      if (d) fetchDiag += d;
-      if (parsed && parsed.lines && parsed.lines.length) {
-        closeTranscriptPanelIfOpen();
-        return { text: parsed.lines.join('\n'), cues: parsed.cues || null, lang: parsed.lang || lang };
-      }
-    } catch (e) { fetchDiag += ' timedtext_err=' + (e && e.message); }
+    // Only failed network paths reach the player-driven fallback, which may
+    // wait up to 1.5 seconds for YouTube to load its caption module.
+    const playerResult = await triggerPlayerCaptions(track);
+    if (playerResult) {
+      closeTranscriptPanelIfOpen();
+      return { text: playerResult.lines.join('\n'), cues: playerResult.cues || null, lang: playerResult.lang || lang };
+    }
 
     // 3. Last resort: transcript panel scraping
     const diagSink = [];
@@ -1301,27 +1436,32 @@
       } else if (cmd === 'download') {
         const isMp3 = format === 'mp3';
         const targetQ = isMp3 ? 'medium' : (QUALITY_BY_HEIGHT[height] || 'hd720');
-        const cap = await captureBackground({ targetQ, end, isMp3, height }, (pct) => reply({ progress: pct, phase: 'buffering' }));
-        const result = assemble();
-        const aud = result.audio;
-        if (!aud) throw new Error('не удалось захватить аудио');
-        const payload = {
-          ok: true,
-          done: true,
-          audio: { mime: aud.mime, size: aud.bytes.byteLength },
-          actualHeight: cap && cap.actualHeight,
-          duration: cap && cap.duration,
-        };
-        const transfers = [aud.bytes.buffer];
-        payload._a = aud.bytes.buffer;
-        if (!isMp3) {
-          const vid = result.video;
-          if (!vid) throw new Error('не удалось захватить видео');
-          payload.video = { mime: vid.mime, size: vid.bytes.byteLength };
-          payload._v = vid.bytes.buffer;
-          transfers.push(vid.bytes.buffer);
+        const previousQuality = qualitySnapshot();
+        try {
+          const cap = await captureBackground({ targetQ, end, isMp3, height }, (pct) => reply({ progress: pct, phase: 'buffering' }));
+          const result = assemble();
+          const aud = result.audio;
+          if (!aud) throw new Error('не удалось захватить аудио');
+          const payload = {
+            ok: true,
+            done: true,
+            audio: { mime: aud.mime, size: aud.bytes.byteLength },
+            actualHeight: result.video?.height || (cap && cap.actualHeight),
+            duration: cap && cap.duration,
+          };
+          const transfers = [aud.bytes.buffer];
+          payload._a = aud.bytes.buffer;
+          if (!isMp3) {
+            const vid = result.video;
+            if (!vid) throw new Error('не удалось захватить видео');
+            payload.video = { mime: vid.mime, size: vid.bytes.byteLength, height: vid.height || null };
+            payload._v = vid.bytes.buffer;
+            transfers.push(vid.bytes.buffer);
+          }
+          reply(payload, transfers);
+        } finally {
+          if (!isMp3) restoreQuality(previousQuality);
         }
-        reply(payload, transfers);
       } else if (cmd === 'subtitles') {
         const res = await getSubtitles();
         reply({ ok: true, done: true, text: res.text, cues: res.cues || null, lang: res.lang });
@@ -1341,7 +1481,18 @@
     }
     store.capturing = true; // keep passive capture on while watching
     scheduleAutoplayOff();
+    scheduleDefaultQuality();
   });
+
+  document.addEventListener('click', (event) => {
+    const item = event.target?.closest?.('.ytp-menuitem');
+    const text = (item?.textContent || '').replace(/\s+/g, ' ').trim();
+    if (item && (/\b(?:4320|2160|1440|1080|720|480|360|240|144)\s*p\b/i.test(text)
+      || /quality|качество/i.test(text))) {
+      manuallySelectedQualityVideoId = vidId();
+      manualQualityRevision += 1;
+    }
+  }, true);
 
   function scheduleAutoplayOff() {
     let tries = 20;
@@ -1351,6 +1502,7 @@
     })();
   }
   scheduleAutoplayOff();
+  scheduleDefaultQuality();
 
   store.videoId = vidId();
   store.capturing = true; // passive capture from page load

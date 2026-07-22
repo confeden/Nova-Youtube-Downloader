@@ -379,7 +379,7 @@
     const isMp3 = format === 'mp3';
     const label = isMp3 ? 'MP3' : `${height}p`;
     notification.set(`Загружаю ${label} в фоне (без прерывания просмотра)…`, 0.02);
-    let scaleMismatch = false;
+    let scaleDown = false;
     const jobId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 
     const onFfmpegProgress = (message) => {
@@ -389,7 +389,7 @@
       const percentText = `${Math.max(0, Math.min(100, percent)).toFixed(percent < 100 ? 1 : 0)}%`;
       const fallback = isMp3
         ? 'Кодирование MP3…'
-        : (scaleMismatch ? 'Масштабирование видео…' : 'Перекодирование в H.264/AAC…');
+        : (scaleDown ? 'Уменьшение видео…' : 'Перекодирование в H.264/AAC…');
       notification.set(`${message.status || fallback} ${percentText}`, value);
     };
     chrome.runtime.onMessage.addListener(onFfmpegProgress);
@@ -400,15 +400,22 @@
         notification.set(`Загрузка сегментов ${label}… ${Math.round(message.progress * 100)}%`, message.progress * 0.4);
       });
 
-      scaleMismatch = !isMp3 && captured.actualHeight && captured.actualHeight !== height;
-      const shouldTranscode = isMp3 || Boolean(transcode) || scaleMismatch;
+      const actualHeight = !isMp3 && Number(captured.actualHeight) > 0 ? Number(captured.actualHeight) : height;
+      scaleDown = !isMp3 && actualHeight > height;
+      const unavailableHigherQuality = !isMp3 && actualHeight < height;
+      const outputHeight = isMp3 ? null : (scaleDown ? height : actualHeight);
+      const shouldTranscode = isMp3 || Boolean(transcode) || scaleDown;
       const status = isMp3
         ? 'Кодирование MP3…'
-        : (scaleMismatch ? 'Масштабирование видео…' : (shouldTranscode ? 'Перекодирование в H.264/AAC…' : 'Склейка дорожек…'));
+        : (scaleDown
+          ? `Уменьшение ${actualHeight}p до ${height}p…`
+          : (unavailableHigherQuality
+            ? `YouTube отдал ${actualHeight}p — сохраняю без апскейлинга…`
+            : (shouldTranscode ? 'Перекодирование в H.264/AAC…' : 'Склейка дорожек…')));
       notification.set(status, 0);
 
       const extension = isMp3 ? '.mp3' : '.mp4';
-      const filename = `${safeFilename(info.title)}${isMp3 ? '' : ` [${height}p]`}${extension}`;
+      const filename = `${safeFilename(info.title)}${isMp3 ? '' : ` [${outputHeight}p]`}${extension}`;
       const result = await muxViaOffscreen({
         jobId,
         format,
@@ -418,7 +425,7 @@
         audioMime: captured.audio?.mime,
         filename,
         transcode: shouldTranscode,
-        scaleHeight: scaleMismatch ? height : 0,
+        scaleHeight: scaleDown ? height : 0,
         duration: Number(captured.duration) || Number(info.duration) || 0,
       });
       if (!result?.ok) {
