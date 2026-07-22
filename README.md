@@ -43,8 +43,7 @@
 ## Компоненты сторонних разработчиков
 
 - [ffmpegwasm/ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) (MIT) — обработка и сборка медиаданных в браузере; встроенное ядро FFmpeg и его кодеки распространяются на условиях применимых к ним лицензий;
-- [HelpFreedom/Triangle-Downloader](https://github.com/HelpFreedom/Triangle-Downloader) (GPL-3.0) — исходная основа расширения; код Nova Youtube Downloader существенно переработан и расширен.
-
+- [HelpFreedom/Triangle-Downloader](https://github.com/HelpFreedom/Triangle-Downloader) (GPL-3.0) — исходная основа для расширения
 ## Диагностика
 
 При ошибке расширение сохраняет `NYD-debug.txt` в стандартную папку загрузок. Файл содержит контекст ошибки и ограниченный журнал последних событий, но не содержимое видео или аудио.
