@@ -1,2 +1,2 @@
-# Nova-Youtube-Downloader-NYD-
+# Nova Youtube Downloader (NYD)
 Скачивание c Youtube видео/аудио/субтитров в удобном формате и разрешении без внешних сервисов
