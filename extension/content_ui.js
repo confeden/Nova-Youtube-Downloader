@@ -140,7 +140,7 @@
 
   function createBrandHeading() {
     const heading = createElement('div', 'nova-menu-head nova-brand-head');
-    const label = createElement('strong');
+    const label = createElement('span');
     const version = chrome.runtime.getManifest().version;
     const link = createElement('a', null, 't.me/nova_txt');
     link.href = 'https://t.me/nova_txt';

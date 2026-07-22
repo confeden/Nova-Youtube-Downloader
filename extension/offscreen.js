@@ -4,6 +4,8 @@
 const { FFmpeg } = FFmpegWASM;
 const FFMPEG_LOG_LIMIT = 40;
 const STALE_JOB_MS = 5 * 60_000;
+const MULTI_THREAD_STALL_MS = 30_000;
+const SINGLE_THREAD_STALL_MS = 90_000;
 
 let ffmpeg;
 let ffmpegLoad;
@@ -34,7 +36,7 @@ function emitProcessingProgress(value) {
   if (!activeJob || activeJob.phase !== 'processing' || !Number.isFinite(value)) return;
   const progress = Math.max(0, Math.min(1, value));
   const now = Date.now();
-  if (progress < activeJob.lastProgress) return;
+  if (progress <= activeJob.lastProgress) return;
   if (progress < 1 && progress - activeJob.lastProgress < 0.001 && now - activeJob.lastProgressAt < 250) return;
   activeJob.lastProgress = progress;
   activeJob.lastProgressAt = now;
@@ -120,6 +122,42 @@ async function getFFmpeg() {
     });
   }
   return ffmpegLoad;
+}
+
+async function replaceWithSingleThread(instance) {
+  try { instance.terminate(); } catch {}
+  ffmpeg = undefined;
+  ffmpegLoad = undefined;
+  const replacement = await loadSingleThreadFFmpeg();
+  ffmpeg = replacement;
+  ffmpegLoad = Promise.resolve(replacement);
+  return replacement;
+}
+
+async function execWithProgressWatchdog(instance, args, job, timeoutMs) {
+  let timer;
+  const stalled = new Promise((_, reject) => {
+    const check = () => {
+      const remaining = timeoutMs - (Date.now() - job.lastProgressAt);
+      if (remaining <= 0) {
+        const error = new Error(`ffmpeg не показывает прогресс более ${Math.round(timeoutMs / 1000)} секунд`);
+        error.code = 'FFMPEG_STALLED';
+        reject(error);
+        return;
+      }
+      timer = setTimeout(check, Math.min(1_000, remaining));
+    };
+    timer = setTimeout(check, Math.min(1_000, timeoutMs));
+  });
+  try {
+    return await Promise.race([instance.exec(args), stalled]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function writeInputFiles(instance, inputs) {
+  for (const input of inputs) await instance.writeFile(input.name, input.bytes);
 }
 
 function decodeBase64(value) {
@@ -292,11 +330,12 @@ async function finalizeJob(message) {
     instance = await getFFmpeg();
 
     sendProgress(0.15, 'Запись буферов дорожек…');
+    const inputs = [];
     const audioName = `audio.${extensionFor(job.audioMime)}`;
     const audioBytes = concatParts(job.audio);
     if (!audioBytes.length) throw new Error('пустые данные аудио');
     assertContainerHeader(audioBytes, job.audioMime, 'audio');
-    await instance.writeFile(audioName, audioBytes);
+    inputs.push({ name: audioName, bytes: audioBytes });
     files.add(audioName);
 
     let videoName;
@@ -305,9 +344,10 @@ async function finalizeJob(message) {
       const videoBytes = concatParts(job.video);
       if (!videoBytes.length) throw new Error('пустые данные видео');
       assertContainerHeader(videoBytes, job.videoMime, 'video');
-      await instance.writeFile(videoName, videoBytes);
+      inputs.push({ name: videoName, bytes: videoBytes });
       files.add(videoName);
     }
+    await writeInputFiles(instance, inputs);
 
     let output;
     let selectedRun;
@@ -315,10 +355,23 @@ async function finalizeJob(message) {
     for (const run of buildRuns(job, videoName, audioName)) {
       ffmpegLogs.length = 0;
       job.lastProgress = 0;
-      job.lastProgressAt = 0;
+      job.lastProgressAt = Date.now();
       sendProgress(0, processingStatus(job), 0);
       files.add(run.out);
-      const exitCode = await instance.exec(run.args);
+      let exitCode;
+      try {
+        const timeout = ffmpegMode === 'multi-thread' ? MULTI_THREAD_STALL_MS : SINGLE_THREAD_STALL_MS;
+        exitCode = await execWithProgressWatchdog(instance, run.args, job, timeout);
+      } catch (error) {
+        if (error?.code !== 'FFMPEG_STALLED' || ffmpegMode !== 'multi-thread') throw error;
+        ffmpegLogs.push(`multi-thread execution stalled: ${error.message}`);
+        sendProgress(0, 'Многопоточный режим завис — повтор в совместимом режиме…', 0);
+        instance = await replaceWithSingleThread(instance);
+        await writeInputFiles(instance, inputs);
+        job.lastProgress = 0;
+        job.lastProgressAt = Date.now();
+        exitCode = await execWithProgressWatchdog(instance, run.args, job, SINGLE_THREAD_STALL_MS);
+      }
       if (exitCode === 0) {
         const candidate = await instance.readFile(run.out).catch(() => null);
         if (candidate?.length) {
