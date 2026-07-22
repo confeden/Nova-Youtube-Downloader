@@ -44,6 +44,7 @@
 
 - [ffmpegwasm/ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) (MIT) — обработка и сборка медиаданных в браузере
 - [HelpFreedom/Triangle-Downloader](https://github.com/HelpFreedom/Triangle-Downloader) (GPL-3.0) — исходная основа для расширения
+- [FFmpeg/FFmpeg](https://github.com/FFmpeg/FFmpeg) (MIT) - оболочка ffmpeg.wasm
 ## Диагностика
 
 При ошибке расширение сохраняет `NYD-debug.txt` в стандартную папку загрузок. Файл содержит контекст ошибки и ограниченный журнал последних событий, но не содержимое видео или аудио.
