@@ -1,6 +1,6 @@
 // content_hook.js — runs in the PAGE (MAIN world) at document_start.
 // Modern YouTube streams separate SABR tracks. This hook passively captures the
-// player's media bytes from fetch/XHR and SourceBuffer, then briefly advances
+// player's ordered media bytes from SourceBuffer, then briefly advances
 // the buffer edge only when the requested tail has not been loaded yet.
 
 (function () {
@@ -44,7 +44,7 @@
   function log(tag, ...args) {
     try {
       const text = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-      console.log('[YTDL ' + tag + '] ' + text);
+      console.log('[NOVA ' + tag + '] ' + text);
       sendLog({ t: 'nova-log', tag, text });
     } catch (e) {}
   }
@@ -54,6 +54,7 @@
     capturing: false,
     tracks: Object.create(null),
     _lastInit: Object.create(null),
+    _pendingInit: Object.create(null),
   };
 
   function vidId() {
@@ -69,6 +70,7 @@
   function resetCapture() {
     store.tracks = Object.create(null);
     store._lastInit = Object.create(null);
+    store._pendingInit = Object.create(null);
   }
 
   const isAv1 = (s) => typeof s === 'string' && /av01|av1\b/i.test(s);
@@ -93,29 +95,6 @@
     if (u8.length >= 8 && u8[4] === 0x66 && u8[5] === 0x74 && u8[6] === 0x79 && u8[7] === 0x70) return true;
     return false;
   }
-  function kindFromContentType(ct) {
-    if (!ct) return null;
-    ct = ct.toLowerCase();
-    if (/audio/.test(ct)) return 'audio';
-    if (/video/.test(ct)) return 'video';
-    return null;
-  }
-  // ---- capture network responses (visible player's own fetches) -------------
-  // Init segments are retained so a SourceBuffer capture that begins between
-  // segments can still produce a self-contained media track.
-  function recordResponse(kind, u8, ct) {
-    if (!kind || !u8 || !u8.length) return;
-    const init = startsWithInit(u8);
-    if (init) {
-      store._lastInit[kind] = { bytes: u8.slice(), mime: ct || '' };
-    }
-    if (store.capturing) {
-      let t = store.tracks[kind];
-      if (!t) t = store.tracks[kind] = { mime: ct || '', parts: [] };
-      t.parts.push(u8.slice());
-    }
-  }
-
   function rememberTimedText(text) {
     if (!text || text.length <= 5) return;
     const captured = window.__nova_captured_timedtext ||= [];
@@ -133,11 +112,7 @@
 
   async function inspectFetchResponse(response, url) {
     try {
-      if (/googlevideo\.com\/videoplayback/.test(url)) {
-        const contentType = response.headers?.get?.('Content-Type');
-        const kind = kindFromContentType(contentType);
-        if (kind) recordResponse(kind, u8of(await response.clone().arrayBuffer()), contentType);
-      } else if (/youtube\.com\/api\/timedtext/.test(url)) {
+      if (/youtube\.com\/api\/timedtext/.test(url)) {
         rememberTimedText(await response.clone().text());
       } else if (/youtubei\/v1\/(?:next|engage)/.test(url)) {
         rememberTranscriptParams(await response.clone().text());
@@ -165,11 +140,7 @@
         this.addEventListener('load', function () {
           const url = this[xhrUrl] || this.responseURL || '';
           try {
-            if (/googlevideo\.com\/videoplayback/.test(url) && this.response) {
-              const contentType = this.getResponseHeader?.('Content-Type');
-              const kind = kindFromContentType(contentType);
-              if (kind) recordResponse(kind, u8of(this.response), contentType);
-            } else if (/youtube\.com\/api\/timedtext/.test(url)) {
+            if (/youtube\.com\/api\/timedtext/.test(url)) {
               rememberTimedText(this.responseText);
             } else if (/youtubei\/v1\/(?:next|engage)/.test(url)) {
               rememberTranscriptParams(this.responseText);
@@ -187,7 +158,7 @@
     };
   } catch (e) {}
 
-  // ---- fallback hook: capture appendBuffer too (covers any gaps) -------------
+  // ---- ordered media capture -------------------------------------------------
   const OrigAddSB = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function (mime) {
     const sb = OrigAddSB.call(this, mime);
@@ -205,12 +176,33 @@
         const u8 = u8of(data);
         if (u8 && u8.length) {
           const init = startsWithInit(u8);
-          if (init) store._lastInit[kind] = { bytes: u8.slice(), mime: this.__novaMime || '' };
-          let t = store.tracks[kind];
-          if (!t) {
-            if (init) t = store.tracks[kind] = { mime: this.__novaMime || '', parts: [u8.slice()] };
-            else if (store._lastInit[kind]) t = store.tracks[kind] = { mime: store._lastInit[kind].mime, parts: [store._lastInit[kind].bytes, u8.slice()] };
-          } else t.parts.push(u8.slice());
+          const mime = this.__novaMime || '';
+          if (init) {
+            const bytes = u8.slice();
+            store._lastInit[kind] = { bytes, mime };
+            if (store.tracks[kind]) {
+              // Keep the complete previous representation until the first media
+              // fragment for the new one arrives; an init-only file is unusable.
+              store._pendingInit[kind] = { bytes, mime };
+            } else {
+              store.tracks[kind] = { mime, parts: [bytes] };
+            }
+          } else {
+            const pendingInit = store._pendingInit[kind];
+            let t;
+            if (pendingInit) {
+              // Atomically switch representations so bytes from different fMP4
+              // tracks never share one output file.
+              t = store.tracks[kind] = { mime: mime || pendingInit.mime, parts: [pendingInit.bytes, u8.slice()] };
+              delete store._pendingInit[kind];
+            } else {
+              t = store.tracks[kind];
+            }
+            if (!t) {
+              const savedInit = store._lastInit[kind];
+              if (savedInit) t = store.tracks[kind] = { mime: mime || savedInit.mime, parts: [savedInit.bytes, u8.slice()] };
+            } else if (!pendingInit) t.parts.push(u8.slice());
+          }
         }
       }
     } catch (e) {}
@@ -222,9 +214,20 @@
     for (const kind of ['audio', 'video']) {
       const t = store.tracks[kind];
       if (!t || !t.parts.length) continue;
-      let n = 0; for (const p of t.parts) n += p.length;
+      let initIndex = -1;
+      for (let index = 0; index < t.parts.length; index++) {
+        if (startsWithInit(t.parts[index])) initIndex = index;
+      }
+      let parts = initIndex >= 0 ? t.parts.slice(initIndex) : t.parts;
+      if (!startsWithInit(parts[0]) && store._lastInit[kind]) {
+        parts = [store._lastInit[kind].bytes, ...parts];
+      }
+      if (!startsWithInit(parts[0])) {
+        throw new Error(`дорожка ${kind} не содержит инициализационный сегмент`);
+      }
+      let n = 0; for (const p of parts) n += p.length;
       const buf = new Uint8Array(n);
-      let o = 0; for (const p of t.parts) { buf.set(p, o); o += p.length; }
+      let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
       out[kind] = { bytes: buf, mime: t.mime };
     }
     return out;

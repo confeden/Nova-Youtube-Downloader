@@ -145,6 +145,50 @@ function extensionFor(mime) {
   return 'bin';
 }
 
+function hasMp4Box(bytes, expected) {
+  for (let offset = 0; offset + 8 <= bytes.length;) {
+    const size = (bytes[offset] * 0x1000000)
+      + (bytes[offset + 1] << 16)
+      + (bytes[offset + 2] << 8)
+      + bytes[offset + 3];
+    const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8));
+    if (type === expected) return true;
+    if (size === 0) break;
+    if (size === 1) {
+      if (offset + 16 > bytes.length) break;
+      const high = (bytes[offset + 8] * 0x1000000)
+        + (bytes[offset + 9] << 16)
+        + (bytes[offset + 10] << 8)
+        + bytes[offset + 11];
+      const low = (bytes[offset + 12] * 0x1000000)
+        + (bytes[offset + 13] << 16)
+        + (bytes[offset + 14] << 8)
+        + bytes[offset + 15];
+      if (high !== 0 || low < 16) break;
+      offset += low;
+    } else {
+      if (size < 8) break;
+      offset += size;
+    }
+  }
+  return false;
+}
+
+function assertContainerHeader(bytes, mime, track) {
+  const isWebM = bytes.length >= 4
+    && bytes[0] === 0x1A && bytes[1] === 0x45 && bytes[2] === 0xDF && bytes[3] === 0xA3;
+  const isMp4 = bytes.length >= 8
+    && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+  const validMp4 = isMp4 && hasMp4Box(bytes, 'moov')
+    && (hasMp4Box(bytes, 'moof') || hasMp4Box(bytes, 'mdat'));
+  if ((/webm/i.test(mime) && !isWebM) || (/mp4/i.test(mime) && !validMp4)) {
+    const signature = [...bytes.subarray(0, 12)]
+      .map((value) => value.toString(16).padStart(2, '0'))
+      .join(' ');
+    throw new Error(`повреждён заголовок дорожки ${track} (${mime || 'unknown'}; ${signature || 'empty'})`);
+  }
+}
+
 function beginJob(message) {
   if (activeJob?.phase === 'receiving' && Date.now() - activeJob.lastActivity > STALE_JOB_MS) {
     activeJob.video.length = 0;
@@ -251,6 +295,7 @@ async function finalizeJob(message) {
     const audioName = `audio.${extensionFor(job.audioMime)}`;
     const audioBytes = concatParts(job.audio);
     if (!audioBytes.length) throw new Error('пустые данные аудио');
+    assertContainerHeader(audioBytes, job.audioMime, 'audio');
     await instance.writeFile(audioName, audioBytes);
     files.add(audioName);
 
@@ -259,6 +304,7 @@ async function finalizeJob(message) {
       videoName = `video.${extensionFor(job.videoMime)}`;
       const videoBytes = concatParts(job.video);
       if (!videoBytes.length) throw new Error('пустые данные видео');
+      assertContainerHeader(videoBytes, job.videoMime, 'video');
       await instance.writeFile(videoName, videoBytes);
       files.add(videoName);
     }

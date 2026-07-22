@@ -29,6 +29,16 @@
   letter-spacing: .06em;
   padding: 8px 12px 4px;
 }
+.nova-brand-head {
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
+}
+.nova-brand-head a { color: #ff6b63; text-decoration: none; }
+.nova-brand-head a:hover { color: #ff8c86; text-decoration: underline; }
 .nova-menu-item {
   color: #fff;
   padding: 9px 14px;

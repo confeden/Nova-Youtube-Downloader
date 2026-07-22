@@ -138,6 +138,20 @@
     return createElement('div', 'nova-menu-head', text);
   }
 
+  function createBrandHeading() {
+    const heading = createElement('div', 'nova-menu-head nova-brand-head');
+    const label = createElement('strong');
+    const version = chrome.runtime.getManifest().version;
+    const link = createElement('a', null, 't.me/nova_txt');
+    link.href = 'https://t.me/nova_txt';
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.addEventListener('click', () => closeMenu());
+    label.append(`Nova Youtube Downloader v${version} | `, link);
+    heading.append(label);
+    return heading;
+  }
+
   function setItemLabel(item, title, description) {
     item.append(createElement('b', null, title));
     if (description) item.append(' ', createElement('span', 'nova-ext', description));
@@ -231,7 +245,7 @@
         chrome.storage.local.get('transcode'),
       ]);
       menu = createElement('div', 'nova-menu');
-      menu.append(createHeading('Nova Youtube Downloader'));
+      menu.append(createBrandHeading());
       addDownloadItems(info);
       addSubtitleItems(info, availability);
       addFormatSelector(settings.transcode);
