@@ -42,7 +42,7 @@
 
 ## Компоненты сторонних разработчиков
 
-- [ffmpegwasm/ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) (MIT) — обработка и сборка медиаданных в браузере; встроенное ядро FFmpeg и его кодеки распространяются на условиях применимых к ним лицензий;
+- [ffmpegwasm/ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) (MIT) — обработка и сборка медиаданных в браузере
 - [HelpFreedom/Triangle-Downloader](https://github.com/HelpFreedom/Triangle-Downloader) (GPL-3.0) — исходная основа для расширения
 ## Диагностика
 
